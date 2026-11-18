@@ -1,0 +1,941 @@
+package com.zeldaromtool
+
+import android.content.Context
+import android.media.MediaScannerConnection
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.DocumentsContract
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.channels.FileChannel
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
+
+private fun hexToBytes(s: String): ByteArray {
+    if (s.length % 2 != 0) throw IllegalStateException("Key has an invalid length")
+    return ByteArray(s.length / 2) { s.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+}
+
+private fun bytesToHex(b: ByteArray): String =
+    b.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+
+internal fun readBytes(ch: FileChannel, pos: Long, len: Int): ByteArray {
+    val bb = ByteBuffer.allocate(len)
+    var p = pos
+    while (bb.hasRemaining()) {
+        val n = ch.read(bb, p)
+        if (n < 0) throw IllegalStateException("File is smaller than expected")
+        p += n
+    }
+    return bb.array()
+}
+
+private fun ecb(mode: Int, key: ByteArray, data: ByteArray): ByteArray {
+    val c = Cipher.getInstance("AES/ECB/NoPadding")
+    c.init(mode, SecretKeySpec(key, "AES"))
+    return c.doFinal(data)
+}
+
+/** AES-XTS for the NCA header (Nintendo uses the sector number in big-endian). */
+private fun xtsDecrypt(key1: ByteArray, key2: ByteArray, data: ByteArray, firstSector: Long): ByteArray {
+    val sectorSize = 0x200
+    val tweakCipher = Cipher.getInstance("AES/ECB/NoPadding")
+    tweakCipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key2, "AES"))
+    val dataCipher = Cipher.getInstance("AES/ECB/NoPadding")
+    dataCipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key1, "AES"))
+
+    val out = ByteArray(data.size)
+    val blk = ByteArray(16)
+    var sector = firstSector
+    var off = 0
+    while (off < data.size) {
+        val t = ByteArray(16)
+        var s = sector
+        for (i in 15 downTo 8) {
+            t[i] = (s and 0xFF).toByte()
+            s = s shr 8
+        }
+        val tw = tweakCipher.doFinal(t)
+        for (b in 0 until sectorSize / 16) {
+            val p = off + b * 16
+            for (i in 0 until 16) blk[i] = (data[p + i].toInt() xor tw[i].toInt()).toByte()
+            val d = dataCipher.doFinal(blk)
+            for (i in 0 until 16) out[p + i] = (d[i].toInt() xor tw[i].toInt()).toByte()
+            // tweak = tweak * alpha (GF(2^128), little-endian)
+            var carry = 0
+            for (i in 0 until 16) {
+                val v = tw[i].toInt() and 0xFF
+                tw[i] = (((v shl 1) and 0xFF) or carry).toByte()
+                carry = v ushr 7
+            }
+            if (carry != 0) tw[0] = (tw[0].toInt() xor 0x87).toByte()
+        }
+        off += sectorSize
+        sector++
+    }
+    return out
+}
+
+class Keys(val prod: Map<String, String>, val title: Map<String, String>) {
+    fun need(name: String): ByteArray {
+        val v = prod[name] ?: throw IllegalStateException("Key missing from prod.keys: $name")
+        return hexToBytes(v)
+    }
+}
+
+class Section(
+    val start: Long,        // start of the section inside the NCA
+    val encType: Int,       // 1 = no encryption, 3 = AES-CTR, 4 = AES-CTR-EX (patch)
+    val fsType: Int,        // 0 = RomFS, 1 = PartitionFS (ExeFS)
+    val hashType: Int,
+    val ctrUpper: ByteArray,
+    val dataOff: Long,      // where the data starts inside the section (-1 = unsupported type)
+    val dataSize: Long,
+    val relOff: Long = 0,   // BKTR relocation table (type 4 only)
+    val relSize: Long = 0,
+    val subOff: Long = 0,   // BKTR subsection table (type 4 only)
+    val subSize: Long = 0
+) {
+    /** Filled in by merging: reader that combines the base game RomFS with the patch. */
+    var bktr: Bktr? = null
+}
+
+class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, tickets: Map<String, ByteArray>) {
+
+    val contentType: Int
+    val titleId: Long
+    val sections = ArrayList<Section>()
+    private val ctrKey: ByteArray
+
+    init {
+        val hdr = readHeader(ch, base, keys)
+        val bb = ByteBuffer.wrap(hdr).order(ByteOrder.LITTLE_ENDIAN)
+        contentType = hdr[0x205].toInt() and 0xFF
+        titleId = bb.getLong(0x210)
+
+        val gen = maxOf(hdr[0x206].toInt() and 0xFF, hdr[0x220].toInt() and 0xFF)
+        val mk = if (gen > 0) gen - 1 else 0
+        val idx = "%02x".format(mk)
+
+        val rights = hdr.copyOfRange(0x230, 0x240)
+        if (rights.any { it.toInt() != 0 }) {
+            // Title key encryption (comes from the NSP's .tik or from title.keys)
+            val rid = bytesToHex(rights)
+            val enc = tickets[rid] ?: keys.title[rid]?.let { hexToBytes(it) }
+                ?: throw IllegalStateException(
+                    "No title key for this game (rights ID $rid). The NSP is missing its .tik, or title.keys is missing."
+                )
+            ctrKey = ecb(Cipher.DECRYPT_MODE, keys.need("titlekek_$idx"), enc)
+        } else {
+            val kind = when (hdr[0x207].toInt() and 0xFF) {
+                0 -> "application"
+                1 -> "ocean"
+                2 -> "system"
+                else -> throw IllegalStateException("Unknown key area type")
+            }
+            val area = ecb(
+                Cipher.DECRYPT_MODE,
+                keys.need("key_area_key_${kind}_$idx"),
+                hdr.copyOfRange(0x300, 0x340)
+            )
+            ctrKey = area.copyOfRange(0x20, 0x30)
+        }
+
+        for (i in 0 until 4) {
+            val start = (bb.getInt(0x240 + i * 0x10).toLong() and 0xFFFFFFFFL) * 0x200
+            val end = (bb.getInt(0x244 + i * 0x10).toLong() and 0xFFFFFFFFL) * 0x200
+            if (end <= start) continue
+            val f = 0x400 + i * 0x200
+            val fsType = hdr[f + 2].toInt() and 0xFF
+            val hashType = hdr[f + 3].toInt() and 0xFF
+            val encType = hdr[f + 4].toInt() and 0xFF
+            val upper = ByteArray(8) { hdr[f + 0x140 + 7 - it] }
+            var dOff = -1L
+            var dSize = 0L
+            if (fsType == 1 && hashType == 2) {
+                dOff = bb.getLong(f + 0x40)
+                dSize = bb.getLong(f + 0x48)
+            } else if (fsType == 0 && hashType == 3) {
+                dOff = bb.getLong(f + 0x90)
+                dSize = bb.getLong(f + 0x98)
+            }
+            var rOff = 0L
+            var rSize = 0L
+            var sOff = 0L
+            var sSize = 0L
+            if (encType == 4) {
+                rOff = bb.getLong(f + 0x100)
+                rSize = bb.getLong(f + 0x108)
+                sOff = bb.getLong(f + 0x120)
+                sSize = bb.getLong(f + 0x128)
+            }
+            sections.add(Section(start, encType, fsType, hashType, upper, dOff, dSize, rOff, rSize, sOff, sSize))
+        }
+    }
+
+    companion object {
+        fun readHeader(ch: FileChannel, base: Long, keys: Keys): ByteArray {
+            val hk = keys.need("header_key")
+            val raw = readBytes(ch, base, 0xC00)
+            val hdr = xtsDecrypt(hk.copyOfRange(0, 16), hk.copyOfRange(16, 32), raw, 0)
+            val magic = String(hdr, 0x200, 4, Charsets.US_ASCII)
+            if (magic != "NCA3") {
+                throw IllegalStateException(
+                    if (magic == "NCA2" || magic == "NCA0") "Old NCA ($magic) is not supported"
+                    else "Could not decrypt the NCA header. Is the header_key in prod.keys correct?"
+                )
+            }
+            return hdr
+        }
+
+        fun peekType(ch: FileChannel, base: Long, keys: Keys): Int =
+            readHeader(ch, base, keys)[0x205].toInt() and 0xFF
+    }
+
+    private val keySpec = SecretKeySpec(ctrKey, "AES")
+
+    // Decryptor reused for short reads (avoids creating a Cipher for every chunk).
+    private val shortLock = Any()
+    private var shortCipher: Cipher? = null
+    private val skipBuf = ByteArray(16)
+
+    /** AES-CTR counter. [ctrVal] (BKTR only) replaces the 4 generation bytes of the counter. */
+    private fun counterFor(upper: ByteArray, ctrVal: Int?, aligned: Long): ByteArray {
+        val counter = ByteArray(16)
+        System.arraycopy(upper, 0, counter, 0, 8)
+        if (ctrVal != null) {
+            counter[4] = (ctrVal ushr 24).toByte()
+            counter[5] = (ctrVal ushr 16).toByte()
+            counter[6] = (ctrVal ushr 8).toByte()
+            counter[7] = ctrVal.toByte()
+        }
+        var o = aligned shr 4
+        for (i in 15 downTo 8) {
+            counter[i] = (o and 0xFF).toByte()
+            o = o shr 8
+        }
+        return counter
+    }
+
+    /** New decryptor, for long streams that keep state between blocks. */
+    private fun ctrCipher(upper: ByteArray, ctrVal: Int?, aligned: Long): Cipher {
+        val c = Cipher.getInstance("AES/CTR/NoPadding")
+        c.init(Cipher.DECRYPT_MODE, keySpec, IvParameterSpec(counterFor(upper, ctrVal, aligned)))
+        return c
+    }
+
+    /** Checks the section encryption type. true = needs AES-CTR decryption. */
+    private fun needsCtr(sec: Section): Boolean {
+        if (sec.encType == 1) return false
+        if (sec.encType == 4) {
+            throw IllegalStateException(
+                "This section belongs to an update (AES-CTR-EX) and needs the base game. Use \"Merge base game + update\"."
+            )
+        }
+        if (sec.encType != 3 && sec.encType != 0) {
+            throw IllegalStateException("Unsupported section encryption (type ${sec.encType}).")
+        }
+        return true
+    }
+
+    private fun cipherAt(sec: Section, aligned: Long): Cipher? =
+        if (needsCtr(sec)) ctrCipher(sec.ctrUpper, null, aligned) else null
+
+    /**
+     * Reads [len] bytes from absolute position [abs] (inside the NCA) directly into [out] and decrypts
+     * in place, with no extra copies or new arrays.
+     */
+    private fun readAbsInto(
+        abs: Long, upper: ByteArray, ctrVal: Int?, decrypt: Boolean,
+        len: Int, out: ByteArray, outOff: Int
+    ) {
+        if (len <= 0) return
+        val bb = ByteBuffer.wrap(out, outOff, len)
+        var rp = base + abs
+        while (bb.hasRemaining()) {
+            val r = ch.read(bb, rp)
+            if (r < 0) throw IllegalStateException("File is smaller than expected")
+            rp += r
+        }
+        if (!decrypt) return
+        val aligned = abs and 15L.inv()
+        val skip = (abs - aligned).toInt()
+        synchronized(shortLock) {
+            val c = shortCipher ?: Cipher.getInstance("AES/CTR/NoPadding").also { shortCipher = it }
+            c.init(Cipher.DECRYPT_MODE, keySpec, IvParameterSpec(counterFor(upper, ctrVal, aligned)))
+            if (skip > 0) c.update(skipBuf, 0, skip, skipBuf, 0) // just advances the counter
+            val dn = c.update(out, outOff, len, out, outOff)
+            if (dn != len) throw IllegalStateException("Decryption failed")
+        }
+    }
+
+    /** Reads [len] bytes of the section with plain AES-CTR (and optional [ctrVal]). Used by the BKTR reader. */
+    fun readCtr(sec: Section, pos: Long, len: Int, ctrVal: Int?): ByteArray {
+        val out = ByteArray(len)
+        readAbsInto(sec.start + pos, sec.ctrUpper, ctrVal, true, len, out, 0)
+        return out
+    }
+
+    /** Same as [readCtr], but writes directly into [out] starting at [outOff]. */
+    fun readCtrInto(sec: Section, pos: Long, len: Int, ctrVal: Int?, out: ByteArray, outOff: Int) {
+        readAbsInto(sec.start + pos, sec.ctrUpper, ctrVal, true, len, out, outOff)
+    }
+
+    /** Links BKTR section [sec] of this NCA (update) to RomFS [baseSec] of base game [baseNca]. */
+    fun attachBase(sec: Section, baseNca: Nca, baseSec: Section) {
+        sec.bktr = Bktr(this, sec, baseNca, baseSec)
+    }
+
+    /** Reads [len] decrypted bytes, starting at [pos] (relative to the section start). */
+    fun read(sec: Section, pos: Long, len: Int): ByteArray {
+        val out = ByteArray(len)
+        readInto(sec, pos, len, out, 0)
+        return out
+    }
+
+    /** Same as [read], but writes directly into [out] starting at [outOff]. */
+    fun readInto(sec: Section, pos: Long, len: Int, out: ByteArray, outOff: Int) {
+        val bk = sec.bktr
+        if (bk != null) {
+            bk.readInto(pos, len, out, outOff)
+            return
+        }
+        readAbsInto(sec.start + pos, sec.ctrUpper, null, needsCtr(sec), len, out, outOff)
+    }
+
+    /**
+     * Decrypts and writes [len] bytes starting at [pos] directly to [out].
+     * Reading/decryption and writing run in parallel (pipeline), with block sizes
+     * chosen by turbo mode (DeviceTuning.current).
+     */
+    fun copyRange(
+        sec: Section, pos: Long, len: Long, out: OutputStream,
+        isCancelled: () -> Boolean, onBytes: (Int) -> Unit
+    ) {
+        val tuning = DeviceTuning.current
+        val bk = sec.bktr
+
+        val fill: (ByteArray) -> Int
+        if (bk != null) {
+            // Update path (BKTR)
+            var p = pos
+            var left = len
+            val maxChunk = tuning.bufferSize
+            fill = { buf ->
+                if (left <= 0L) {
+                    -1
+                } else {
+                    val n = minOf(minOf(maxChunk, buf.size).toLong(), left).toInt()
+                    bk.readInto(p, n, buf, 0)
+                    p += n
+                    left -= n
+                    n
+                }
+            }
+        } else {
+            // Normal path (base game)
+            val abs = sec.start + pos
+            var cur = abs and 15L.inv()
+            var toSkip = (abs - cur).toInt()
+            val c = cipherAt(sec, cur)
+            var remaining = len
+            val scratch = if (c != null) ByteArray(tuning.bufferSize) else null
+            fill = { buf ->
+                if (remaining <= 0L) {
+                    -1
+                } else {
+                    val want = minOf(buf.size.toLong(), remaining + toSkip).toInt()
+                    val target = scratch ?: buf
+                    val bb = ByteBuffer.wrap(target, 0, want)
+                    var rp = base + cur
+                    while (bb.hasRemaining()) {
+                        val r = ch.read(bb, rp)
+                        if (r < 0) throw IllegalStateException("File is smaller than expected")
+                        rp += r
+                    }
+                    if (c != null) {
+                        val dn = c.update(target, 0, want, buf, 0)
+                        if (dn != want) throw IllegalStateException("Decryption failed")
+                    }
+                    val n = want - toSkip
+                    if (toSkip > 0) System.arraycopy(buf, toSkip, buf, 0, n)
+                    remaining -= n
+                    cur += want
+                    toSkip = 0
+                    n
+                }
+            }
+        }
+
+        if (!copyPipelined(fill, out, tuning, isCancelled, onBytes)) throw RomExtractor.Cancelled()
+    }
+
+    /** Lists the files of an ExeFS (PFS0). Offsets are relative to the section. */
+    fun listPfs0(sec: Section): List<RomExtractor.Entry> {
+        val h = ByteBuffer.wrap(read(sec, sec.dataOff, 16)).order(ByteOrder.LITTLE_ENDIAN)
+        if (h.getInt(0) != 0x30534650) {
+            throw IllegalStateException("Failed to decrypt the ExeFS. Check that prod.keys has the keys for this game's firmware version.")
+        }
+        val count = h.getInt(4)
+        val strSize = h.getInt(8)
+        if (count < 0 || count > 10_000 || strSize < 0 || strSize > (1 shl 20)) {
+            throw IllegalStateException("Corrupted ExeFS")
+        }
+        val tableLen = count * 0x18 + strSize
+        val t = read(sec, sec.dataOff + 16, tableLen)
+        val tb = ByteBuffer.wrap(t).order(ByteOrder.LITTLE_ENDIAN)
+        val dataStart = sec.dataOff + 16 + tableLen
+        val out = ArrayList<RomExtractor.Entry>()
+        for (i in 0 until count) {
+            val off = tb.getLong(i * 0x18)
+            val size = tb.getLong(i * 0x18 + 8)
+            val nameOff = count * 0x18 + tb.getInt(i * 0x18 + 16)
+            var end = nameOff
+            while (end < t.size && t[end] != 0.toByte()) end++
+            out.add(RomExtractor.Entry(String(t, nameOff, end - nameOff, Charsets.UTF_8), dataStart + off, size))
+        }
+        return out
+    }
+
+    /** Lists all RomFS files (with path). Offsets are relative to the section. */
+    fun listRomFs(sec: Section): List<RomExtractor.Entry> {
+        val h = ByteBuffer.wrap(read(sec, sec.dataOff, 0x50)).order(ByteOrder.LITTLE_ENDIAN)
+        if (h.getLong(0) != 0x50L) {
+            throw IllegalStateException("Failed to decrypt the RomFS. Check that prod.keys has the keys for this game's firmware version.")
+        }
+        val dirOff = h.getLong(0x18)
+        val dirSize = h.getLong(0x20)
+        val fileOff = h.getLong(0x38)
+        val fileSize = h.getLong(0x40)
+        val dataOff = h.getLong(0x48)
+        val max = 64L * 1024 * 1024
+        if (dirSize < 0 || dirSize > max || fileSize < 0 || fileSize > max) {
+            throw IllegalStateException("Corrupted RomFS")
+        }
+        val dir = read(sec, sec.dataOff + dirOff, dirSize.toInt())
+        val files = read(sec, sec.dataOff + fileOff, fileSize.toInt())
+        val d = ByteBuffer.wrap(dir).order(ByteOrder.LITTLE_ENDIAN)
+        val f = ByteBuffer.wrap(files).order(ByteOrder.LITTLE_ENDIAN)
+
+        val result = ArrayList<RomExtractor.Entry>()
+        var guard = 0
+
+        fun walk(dirOffset: Int, prefix: String) {
+            val nameLen = d.getInt(dirOffset + 20)
+            val myPath = if (dirOffset == 0) "" else
+                prefix + String(dir, dirOffset + 24, nameLen, Charsets.UTF_8) + "/"
+            var fo = d.getInt(dirOffset + 12)
+            while (fo != -1) {
+                if (++guard > 2_000_000) throw IllegalStateException("Corrupted RomFS")
+                val nl = f.getInt(fo + 28)
+                val name = String(files, fo + 32, nl, Charsets.UTF_8)
+                result.add(
+                    RomExtractor.Entry(myPath + name, sec.dataOff + dataOff + f.getLong(fo + 8), f.getLong(fo + 16))
+                )
+                fo = f.getInt(fo + 4)
+            }
+            var sub = d.getInt(dirOffset + 8)
+            while (sub != -1) {
+                if (++guard > 2_000_000) throw IllegalStateException("Corrupted RomFS")
+                walk(sub, myPath)
+                sub = d.getInt(sub + 4)
+            }
+        }
+        walk(0, "")
+        return result
+    }
+}
+
+object GameExtractor {
+
+    internal class Item(val path: String, val sec: Section, val nca: Nca, val pos: Long, val size: Long)
+    private data class ChildDocument(val id: String, val mimeType: String)
+
+    /** Finds a child file or directory inside the SAF folder. */
+    private fun findChild(
+        ctx: Context,
+        treeUri: Uri,
+        parentId: String,
+        name: String
+    ): ChildDocument? {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE
+        )
+        ctx.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+            val idCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            while (cursor.moveToNext()) {
+                if (cursor.getString(nameCol) == name) {
+                    return ChildDocument(cursor.getString(idCol), cursor.getString(mimeCol))
+                }
+            }
+        }
+        return null
+    }
+
+    /** Creates or reuses a folder inside the destination chosen by the user. */
+    private fun ensureDirectory(
+        ctx: Context,
+        treeUri: Uri,
+        parentId: String,
+        name: String
+    ): Uri {
+        val existing = findChild(ctx, treeUri, parentId, name)
+        if (existing != null && existing.mimeType == DocumentsContract.Document.MIME_TYPE_DIR) {
+            return DocumentsContract.buildDocumentUriUsingTree(treeUri, existing.id)
+        }
+        if (existing != null) {
+            val oldUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, existing.id)
+            DocumentsContract.deleteDocument(ctx.contentResolver, oldUri)
+        }
+        val parentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, parentId)
+        return DocumentsContract.createDocument(
+            ctx.contentResolver,
+            parentUri,
+            DocumentsContract.Document.MIME_TYPE_DIR,
+            name
+        ) ?: throw IllegalStateException("Could not create the folder: $name")
+    }
+
+    /** Creates or replaces a file in the SAF destination. */
+    private fun createOutputFile(
+        ctx: Context,
+        treeUri: Uri,
+        parentId: String,
+        name: String
+    ): Uri {
+        val existing = findChild(ctx, treeUri, parentId, name)
+        if (existing != null) {
+            val oldUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, existing.id)
+            DocumentsContract.deleteDocument(ctx.contentResolver, oldUri)
+        }
+        val parentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, parentId)
+        return DocumentsContract.createDocument(
+            ctx.contentResolver,
+            parentUri,
+            "application/octet-stream",
+            name
+        ) ?: throw IllegalStateException("Could not create the file: $name")
+    }
+
+    /** Encrypted title key from a common ticket: returns rightsId (hex) -> encrypted key. */
+    internal fun parseTicket(b: ByteArray): Pair<String, ByteArray>? {
+        if (b.size < 4) return null
+        val sigType = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN).getInt(0)
+        val skip = when (sigType) {
+            0x10000, 0x10003 -> 0x240
+            0x10001, 0x10004 -> 0x140
+            0x10002, 0x10005 -> 0x80
+            else -> return null
+        }
+        if (b.size < skip + 0x170) return null
+        if (b[skip + 0x141].toInt() != 0) return null // personalized ticket (RSA): cannot be used
+        return bytesToHex(b.copyOfRange(skip + 0x160, skip + 0x170)) to b.copyOfRange(skip + 0x40, skip + 0x50)
+    }
+
+    private fun safePath(path: String): String {
+        val parts = path.split('/').filter { it.isNotEmpty() }
+        if (parts.isEmpty() || parts.any { it == ".." || it == "." }) {
+            throw IllegalStateException("Invalid path inside the ROM: $path")
+        }
+        return parts.joinToString("/")
+    }
+
+    /** Loads the prod.keys and title.keys imported by the user. */
+    internal fun loadKeys(ctx: Context): Keys {
+        val prodFile = KeysManager.prodFile(ctx)
+        if (!prodFile.exists()) throw IllegalStateException("Import prod.keys first.")
+        val titleFile = KeysManager.titleFile(ctx)
+        return Keys(
+            KeysManager.parse(prodFile.readText()),
+            if (titleFile.exists()) KeysManager.parse(titleFile.readText()) else emptyMap()
+        )
+    }
+
+    /** Common title keys from an NSP's .tik files. */
+    internal fun collectTickets(ch: FileChannel, entries: List<RomExtractor.Entry>): HashMap<String, ByteArray> {
+        val tickets = HashMap<String, ByteArray>()
+        for (e in entries) {
+            if (e.name.endsWith(".tik", true) && e.size in 0x200L..0x1000L) {
+                parseTicket(readBytes(ch, e.offset, e.size.toInt()))?.let { tickets[it.first] = it.second }
+            }
+        }
+        return tickets
+    }
+
+    /** DLC NCA (AddOnContent): type 5 (PublicData); some also show up as 4 (Data). */
+    internal fun isDlcType(contentType: Int): Boolean = contentType == 4 || contentType == 5
+
+    /**
+     * Collects the files of one or more DLC NCAs. With a single DLC, it goes straight to romfs/;
+     * with several in the same file, each one goes to its own dlc_<TitleID>/ folder.
+     */
+    internal fun listDlcItems(dlc: List<Nca>): List<Item> {
+        val out = ArrayList<Item>()
+        val used = HashMap<Long, Int>()
+        for (n in dlc) {
+            var prefix = ""
+            if (dlc.size > 1) {
+                val seen = used[n.titleId] ?: 0
+                used[n.titleId] = seen + 1
+                prefix = "dlc_%016x".format(n.titleId) + (if (seen > 0) "_${seen + 1}" else "") + "/"
+            }
+            for (item in listItems(n, true, true)) out.add(Item(prefix + item.path, item.sec, item.nca, item.pos, item.size))
+        }
+        return out
+    }
+
+    /**
+     * Says what the file is, looking only at the NCA headers: "Game/update", "DLC" or
+     * null if it could not tell. Never throws (it is only for display).
+     */
+    fun kindOf(ctx: Context, uri: Uri, entries: List<RomExtractor.Entry>): String? = try {
+        val keys = loadKeys(ctx)
+        ctx.contentResolver.openFileDescriptor(uri, "r")?.use { p ->
+            val ch = FileInputStream(p.fileDescriptor).channel
+            var hasProgram = false
+            var hasDlc = false
+            for (e in entries) {
+                if (!e.name.endsWith(".nca", true)) continue
+                val t = Nca.peekType(ch, e.offset, keys)
+                if (t == 0) hasProgram = true
+                if (isDlcType(t)) hasDlc = true
+            }
+            if (hasProgram) "Game/update" else if (hasDlc) "DLC" else null
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Lists the ExeFS and/or RomFS files of a Program NCA. */
+    internal fun listItems(nca: Nca, wantExefs: Boolean, wantRomfs: Boolean): List<Item> {
+        val items = ArrayList<Item>()
+        var pfsCount = 0
+        for (sec in nca.sections) {
+            if (sec.dataOff < 0) {
+                throw IllegalStateException(
+                    "Unsupported section type (fs=${sec.fsType}, hash=${sec.hashType}, crypto=${sec.encType})."
+                )
+            }
+            if (sec.fsType == 1) {
+                val dir = if (pfsCount++ == 0) "exefs" else "logo"
+                if (wantExefs) {
+                    for (e in nca.listPfs0(sec)) items.add(Item("$dir/${e.name}", sec, nca, e.offset, e.size))
+                }
+            } else if (wantRomfs) {
+                for (e in nca.listRomFs(sec)) items.add(Item("romfs/${e.name}", sec, nca, e.offset, e.size))
+            }
+        }
+        return items
+    }
+
+    /** If the app has "All files access" and the folder is on internal storage, returns the real path. */
+    private fun directRoot(treeUri: Uri): File? {
+        if (Build.VERSION.SDK_INT < 30 || !Environment.isExternalStorageManager()) return null
+        return try {
+            val id = DocumentsContract.getTreeDocumentId(treeUri)
+            if (!id.startsWith("primary:")) null
+            else File(Environment.getExternalStorageDirectory(), id.removePrefix("primary:"))
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Asks Android to rescan the output folder. With the .nomedia already there, the Gallery
+     * hides what it had indexed before. Only works for internal storage.
+     */
+    private fun rescanOutput(ctx: Context, treeUri: Uri, folderName: String) {
+        try {
+            val id = DocumentsContract.getTreeDocumentId(treeUri)
+            if (!id.startsWith("primary:")) return
+            val base = File(Environment.getExternalStorageDirectory(), id.removePrefix("primary:"))
+            val folder = File(base, folderName)
+            MediaScannerConnection.scanFile(
+                ctx,
+                arrayOf(folder.absolutePath, File(folder, ".nomedia").absolutePath),
+                null,
+                null
+            )
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Decrypts and writes the [items] to folder [outFolderName], inside the chosen destination. */
+    internal fun writeItems(
+        ctx: Context,
+        outTreeUri: Uri,
+        outFolderName: String,
+        items: List<Item>,
+        isCancelled: () -> Boolean,
+        onProgress: (done: Long, total: Long, file: String) -> Unit
+    ) {
+        val total = items.sumOf { it.size }
+
+        // Direct (fast) path when possible; otherwise, SAF with a folder cache.
+        val direct = directRoot(outTreeUri)?.let { File(it, outFolderName) }?.takeIf { it.isDirectory || it.mkdirs() }
+        val sink: Sink = if (direct != null) DirectSink(direct) else SafSink(ctx, outTreeUri, outFolderName)
+
+        // Keep extracted files out of the Gallery: .nomedia at the root and in each
+        // top-level folder (exefs, romfs, logo), BEFORE writing any file.
+        sink.markNoMedia("")
+        items.map { safePath(it.path) }
+            .filter { it.contains('/') }
+            .map { it.substringBefore('/') }
+            .distinct()
+            .forEach { sink.markNoMedia(it) }
+        rescanOutput(ctx, outTreeUri, outFolderName)
+
+        // Choose the performance profile (RAM + real speed of the destination folder)
+        val speed = DeviceTuning.measureSpeedMBs(
+            openOut = { sink.open(".speedtest") },
+            cleanup = { sink.discard(".speedtest") },
+            testMb = 128
+        )
+        DeviceTuning.current = DeviceTuning.choose(ctx, speed)
+        onProgress(
+            0, total,
+            String.format(
+                "%s • disk %.0f MB/s",
+                if (DeviceTuning.current.turbo) "Turbo mode enabled" else "Standard mode",
+                speed
+            )
+        )
+
+        var done = 0L
+        var last = 0L
+        val startNs = System.nanoTime()
+        fun label(name: String): String {
+            val sec = (System.nanoTime() - startNs) / 1e9
+            return if (sec < 3.0 || done <= 0L) name
+            else String.format("%s  •  %.0f MB/s", name, done / 1048576.0 / sec)
+        }
+        for (item in items) {
+            if (isCancelled()) throw RomExtractor.Cancelled()
+            val path = safePath(item.path)
+            try {
+                sink.open(path).use { os ->
+                    item.nca.copyRange(item.sec, item.pos, item.size, os, isCancelled) { n ->
+                        done += n
+                        val now = System.currentTimeMillis()
+                        if (now - last >= 500) {
+                            last = now
+                            onProgress(done, total, label(item.path))
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                sink.discard(path)
+                throw t
+            }
+            onProgress(done, total, label(item.path))
+        }
+
+        // Final rescan: makes sure the Gallery hides everything that was just written.
+        rescanOutput(ctx, outTreeUri, outFolderName)
+    }
+
+    /**
+     * Decrypts the game's "Program" NCA and writes ExeFS and RomFS to the folder chosen by the user.
+     * Call off the main thread.
+     */
+    fun extract(
+        ctx: Context,
+        romUri: Uri,
+        entries: List<RomExtractor.Entry>,
+        outTreeUri: Uri,
+        outFolderName: String,
+        isCancelled: () -> Boolean,
+        onProgress: (done: Long, total: Long, file: String) -> Unit
+    ) {
+        if (entries.any { it.name.endsWith(".ncz", true) }) {
+            throw IllegalStateException("NSZ/XCZ (compressed) is not supported. Use a regular NSP or XCI.")
+        }
+        val keys = loadKeys(ctx)
+
+        val pfd = ctx.contentResolver.openFileDescriptor(romUri, "r")
+            ?: throw IllegalStateException("Could not open the ROM")
+        pfd.use { p ->
+            val ch = FileInputStream(p.fileDescriptor).channel
+            val tickets = collectTickets(ch, entries)
+
+            var program: Nca? = null
+            for (e in entries) {
+                if (!e.name.endsWith(".nca", true)) continue
+                if (Nca.peekType(ch, e.offset, keys) == 0) {
+                    program = Nca(ch, e.offset, keys, tickets)
+                    break
+                }
+            }
+
+            val items: List<Item>
+            if (program != null) {
+                items = listItems(program, true, true)
+            } else {
+                // No game NCA (Program): check whether the file is a DLC (data NCA, RomFS only).
+                val dlc = ArrayList<Nca>()
+                for (e in entries) {
+                    if (!e.name.endsWith(".nca", true)) continue
+                    if (isDlcType(Nca.peekType(ch, e.offset, keys))) dlc.add(Nca(ch, e.offset, keys, tickets))
+                }
+                if (dlc.isEmpty()) {
+                    throw IllegalStateException("Could not find a game (Program) NCA or a DLC NCA in this ROM.")
+                }
+                items = listDlcItems(dlc)
+                onProgress(0, items.sumOf { it.size }, "DLC detected: extracting the RomFS")
+            }
+            if (items.isEmpty()) throw IllegalStateException("No ExeFS/RomFS files found.")
+            writeItems(ctx, outTreeUri, outFolderName, items, isCancelled, onProgress)
+        }
+    }
+}
+
+/** Write destination: creates the needed folders and returns the file stream. */
+private interface Sink {
+    fun open(path: String): OutputStream
+    fun openRead(path: String): InputStream
+    fun discard(path: String)
+
+    /** Creates the .nomedia file in folder [dir] ("" = root of the output folder). */
+    fun markNoMedia(dir: String)
+}
+
+/** Direct write via real path (fast). */
+private class DirectSink(private val root: File) : Sink {
+    override fun open(path: String): OutputStream {
+        val f = File(root, path)
+        f.parentFile?.mkdirs()
+        return FileOutputStream(f)
+    }
+
+    override fun openRead(path: String): InputStream = FileInputStream(File(root, path))
+
+    override fun discard(path: String) {
+        File(root, path).delete()
+    }
+
+    override fun markNoMedia(dir: String) {
+        val d = if (dir.isEmpty()) root else File(root, dir)
+        d.mkdirs()
+        val f = File(d, ".nomedia")
+        if (!f.exists()) f.createNewFile()
+    }
+}
+
+/** Write via SAF, listing each folder only once (it used to be one query per file). */
+private class SafSink(ctx: Context, private val tree: Uri, rootName: String) : Sink {
+    private val cr = ctx.contentResolver
+    private val dirIds = HashMap<String, String>()
+    private val kids = HashMap<String, HashMap<String, Pair<String, String>>>()
+    private val files = HashMap<String, Uri>()
+    private val dirMime = DocumentsContract.Document.MIME_TYPE_DIR
+
+    init {
+        dirIds[""] = ensureDir(DocumentsContract.getTreeDocumentId(tree), rootName)
+    }
+
+    private fun children(parentId: String): HashMap<String, Pair<String, String>> =
+        kids.getOrPut(parentId) {
+            val map = HashMap<String, Pair<String, String>>()
+            val uri = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentId)
+            val proj = arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE
+            )
+            cr.query(uri, proj, null, null, null)?.use { c ->
+                while (c.moveToNext()) map[c.getString(1)] = Pair(c.getString(0), c.getString(2))
+            }
+            map
+        }
+
+    private fun ensureDir(parentId: String, name: String): String {
+        val map = children(parentId)
+        val ex = map[name]
+        if (ex != null && ex.second == dirMime) return ex.first
+        if (ex != null) {
+            DocumentsContract.deleteDocument(cr, DocumentsContract.buildDocumentUriUsingTree(tree, ex.first))
+            map.remove(name)
+        }
+        val parentUri = DocumentsContract.buildDocumentUriUsingTree(tree, parentId)
+        val created = DocumentsContract.createDocument(cr, parentUri, dirMime, name)
+            ?: throw IllegalStateException("Could not create the folder: $name")
+        val id = DocumentsContract.getDocumentId(created)
+        map[name] = Pair(id, dirMime)
+        kids[id] = HashMap() // new folder: it is empty, no need to list it
+        return id
+    }
+
+    override fun open(path: String): OutputStream {
+        val parts = path.split('/')
+        var parentPath = ""
+        var parentId = dirIds[""] ?: throw IllegalStateException("Destination folder not created")
+        for (d in parts.dropLast(1)) {
+            val p = if (parentPath.isEmpty()) d else "$parentPath/$d"
+            val known = dirIds[p]
+            parentId = if (known != null) known else ensureDir(parentId, d).also { dirIds[p] = it }
+            parentPath = p
+        }
+        val name = parts.last()
+        val map = children(parentId)
+        val old = map[name]
+        if (old != null) {
+            DocumentsContract.deleteDocument(cr, DocumentsContract.buildDocumentUriUsingTree(tree, old.first))
+            map.remove(name)
+        }
+        val parentUri = DocumentsContract.buildDocumentUriUsingTree(tree, parentId)
+        val uri = DocumentsContract.createDocument(cr, parentUri, "application/octet-stream", name)
+            ?: throw IllegalStateException("Could not create the file: $name")
+        map[name] = Pair(DocumentsContract.getDocumentId(uri), "application/octet-stream")
+        files[path] = uri
+        return cr.openOutputStream(uri, "w")
+            ?: throw IllegalStateException("Could not open the file for writing: $path")
+    }
+
+    override fun openRead(path: String): InputStream {
+        val uri = files[path] ?: throw IllegalStateException("Test file not found")
+        return cr.openInputStream(uri)
+            ?: throw IllegalStateException("Could not read the test file")
+    }
+
+    override fun discard(path: String) {
+        val uri = files[path] ?: return
+        try {
+            DocumentsContract.deleteDocument(cr, uri)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun displayNameOf(uri: Uri): String? = try {
+        cr.query(uri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use {
+            if (it.moveToFirst()) it.getString(0) else null
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Creates the .nomedia and checks that Android did not rename it (e.g. ".nomedia.bin"). */
+    override fun markNoMedia(dir: String) {
+        val path = if (dir.isEmpty()) ".nomedia" else "$dir/.nomedia"
+        open(path).close()
+        val uri = files[path] ?: return
+        val real = displayNameOf(uri)
+        if (real != null && real != ".nomedia") {
+            try {
+                DocumentsContract.renameDocument(cr, uri, ".nomedia")
+            } catch (_: Exception) {
+            }
+        }
+    }
+}
